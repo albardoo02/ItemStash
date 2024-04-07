@@ -9,10 +9,14 @@ import org.jetbrains.annotations.Nullable;
 import org.mariadb.jdbc.Driver;
 
 import java.sql.*;
-import java.util.Objects;
-import java.util.UUID;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.function.Function;
 
 public class DBConnector {
+    private static final Timer TIMER = new Timer(true);
+    private static final @NotNull Deque<QueryData<Object>> QUERY_QUEUE = new ConcurrentLinkedDeque<>();
     private static @Nullable HikariDataSource dataSource;
 
     /**
@@ -32,10 +36,50 @@ public class DBConnector {
         config.setDataSourceProperties(databaseConfig.properties());
         dataSource = new HikariDataSource(config);
         createTables();
+        TIMER.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                if (QUERY_QUEUE.isEmpty()) {
+                    return;
+                }
+                try {
+                    use(connection -> {
+                        while (!QUERY_QUEUE.isEmpty()) {
+                            QueryData<Object> data = QUERY_QUEUE.peek();
+                            if (data == null) {
+                                return;
+                            }
+                            //noinspection SqlSourceToSinkFlow
+                            try (PreparedStatement statement = connection.prepareStatement(data.sql)) {
+                                for (int i = 0; i < data.args.size(); i++) {
+                                    statement.setObject(i + 1, data.args.get(i));
+                                }
+                                try (ResultSet rs = statement.executeQuery()) {
+                                    data.future.complete(data.resultExtractor.apply(rs));
+                                }
+                            }
+                            QUERY_QUEUE.remove();
+                        }
+                    });
+                } catch (SQLException ignored) {
+                }
+            }
+        }, 500, 500);
         return getPrepareStatement("DELETE FROM `stashes` WHERE `expires_at` > 0 AND `expires_at` < ?", stmt -> {
             stmt.setLong(1, System.currentTimeMillis());
             return stmt.executeUpdate();
         });
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T> @NotNull CompletableFuture<T> queryWithRetry(@NotNull String sql, @NotNull List<?> values, @NotNull Function<ResultSet, T> resultExtractor) {
+        QueryData<T> data = new QueryData<>(sql, values, resultExtractor);
+        QUERY_QUEUE.add((QueryData<Object>) data);
+        return data.future;
+    }
+
+    public static @NotNull CompletableFuture<Void> executeWithRetry(@NotNull String sql, @NotNull List<?> values) {
+        return queryWithRetry(sql, values, rs -> null);
     }
 
     public static void createTables() throws SQLException {

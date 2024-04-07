@@ -32,7 +32,7 @@ public class PickupStashCommand implements TabExecutor {
             return true;
         }
         Player player = (Player) sender;
-        if (false && args.length == 1 && args[0].equalsIgnoreCase("nogui")) {
+        if (args.length == 1 && args[0].equalsIgnoreCase("nogui")) {
             if (PROCESSING.contains(player.getUniqueId())) {
                 player.sendMessage(ChatColor.RED + "前回の処理が継続中です。しばらくしてからお試しください。(Local)");
                 return true;
@@ -48,18 +48,12 @@ public class PickupStashCommand implements TabExecutor {
                         player.sendMessage(ChatColor.GRAY + "処理中です...");
                         DBConnector.setOperationInProgress(player.getUniqueId(), true);
                         long start = System.currentTimeMillis();
-                        int count = plugin.getStashItemCount(player.getUniqueId());
-                        if (count == 0) {
-                            long total = System.currentTimeMillis() - start;
-                            player.sendMessage(ChatColor.RED + "Stashは空です。" + ChatColor.DARK_GRAY + " [" + total + "ms]");
-                            return;
-                        }
                         plugin.dumpStash(player).thenAccept(result -> {
                             long total = System.currentTimeMillis() - start;
-                            if (result && count <= 100) {
-                                player.sendMessage(ChatColor.GREEN + "アイテムをすべて受け取りました。(処理前の件数: " + count + ")" + ChatColor.DARK_GRAY + " [" + total + "ms]");
+                            if (result) {
+                                player.sendMessage(ChatColor.GREEN + "アイテムをすべて受け取りました。" + ChatColor.DARK_GRAY + " [" + total + "ms]");
                             } else {
-                                player.sendMessage(ChatColor.RED + "一部のアイテムを受け取れませんでした。(処理前の件数: " + count + ")" + ChatColor.DARK_GRAY + " [" + total + "ms]");
+                                player.sendMessage(ChatColor.RED + "一部のアイテムを受け取れませんでした。" + ChatColor.DARK_GRAY + " [" + total + "ms]");
                             }
                         });
                     } finally {

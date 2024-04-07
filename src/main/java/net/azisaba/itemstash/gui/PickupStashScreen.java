@@ -7,6 +7,7 @@ import net.azisaba.itemstash.sql.DBConnector;
 import net.azisaba.itemstash.util.ItemUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
+import org.bukkit.Material;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -15,6 +16,7 @@ import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.jetbrains.annotations.NotNull;
 import org.mariadb.jdbc.MariaDbBlob;
 
@@ -26,6 +28,7 @@ public class PickupStashScreen implements InventoryHolder {
     private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
     private final Inventory inventory = Bukkit.createInventory(this, 54, "Stash回収");
     private final List<Map.Entry<ItemStack, Long>> items;
+    private int page = 0;
     private boolean acceptingClick = true;
 
     public PickupStashScreen(@NotNull List<Map.Entry<@NotNull ItemStack, @NotNull Long>> items) {
@@ -50,13 +53,14 @@ public class PickupStashScreen implements InventoryHolder {
     }
 
     public void initInventory() {
-        for (int i = 0; i < items.subList(0, Math.min(53, items.size())).size(); i++) {
-            ItemStack screenItem = items.get(i).getKey().clone();
+        inventory.clear();
+        for (int i = 0; i < items.subList(page * 45, Math.min((page + 1) * 45, items.size())).size(); i++) {
+            ItemStack screenItem = items.get(page * 45 + i).getKey().clone();
             if (screenItem.getItemMeta() == null) {
                 ((ItemStashPlugin) ItemStash.getInstance()).getSLF4JLogger().info("{} (#{}) does not have item meta", screenItem, i);
                 continue;
             }
-            long expiresAt = items.get(i).getValue();
+            long expiresAt = items.get(page * 45 + i).getValue();
             List<String> lore = screenItem.getLore();
             if (lore == null) {
                 lore = new ArrayList<>();
@@ -70,6 +74,16 @@ public class PickupStashScreen implements InventoryHolder {
             screenItem.setLore(lore);
             inventory.setItem(i, screenItem);
         }
+        ItemStack previousPage = new ItemStack(Material.ARROW);
+        ItemMeta meta1 = previousPage.getItemMeta();
+        meta1.setDisplayName(ChatColor.GOLD + "前のページ");
+        previousPage.setItemMeta(meta1);
+        inventory.setItem(45, previousPage);
+        ItemStack nextPage = new ItemStack(Material.ARROW);
+        ItemMeta meta2 = nextPage.getItemMeta();
+        meta2.setDisplayName(ChatColor.GOLD + "次のページ");
+        nextPage.setItemMeta(meta2);
+        inventory.setItem(53, nextPage);
     }
 
     @Override
@@ -102,11 +116,25 @@ public class PickupStashScreen implements InventoryHolder {
             }
             PickupStashScreen screen = (PickupStashScreen) e.getInventory().getHolder();
             if (!screen.acceptingClick) return;
-            if (screen.items.size() <= e.getSlot()) {
+            if (e.getSlot() == 45) {
+                if (screen.page > 0) {
+                    screen.page--;
+                    screen.initInventory();
+                }
+                return;
+            }
+            if (e.getSlot() == 53) {
+                if (screen.page < screen.items.size() / 45) {
+                    screen.page++;
+                    screen.initInventory();
+                }
+                return;
+            }
+            if (e.getSlot() >= 45 || e.getCurrentItem() == null || e.getCurrentItem().getType() == Material.AIR) {
                 return;
             }
             PickupStashCommand.PROCESSING.add(e.getWhoClicked().getUniqueId());
-            ItemStack stack = screen.items.get(e.getSlot()).getKey();
+            ItemStack stack = screen.items.get(screen.page * 45 + e.getSlot()).getKey();
             int originalAmount = stack.getAmount();
             screen.acceptingClick = false;
             Bukkit.getScheduler().runTask(plugin, () -> {
