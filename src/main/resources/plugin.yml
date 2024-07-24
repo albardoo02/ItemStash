@@ -5,6 +5,7 @@ author: Azisaba Network
 api-version: 1.15
 softdepend:
   - LifeCore
+  - StorageBox
 commands:
   pickupstash:
     permission: itemstash.pickupstash

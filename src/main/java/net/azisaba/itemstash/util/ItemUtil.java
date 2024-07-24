@@ -1,6 +1,7 @@
 package net.azisaba.itemstash.util;
 
 import org.apache.commons.lang.Validate;
+import org.bukkit.Bukkit;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.jetbrains.annotations.NotNull;
@@ -44,6 +45,9 @@ public class ItemUtil {
         label:
         for (int i = 0; i < items.length; ++i) {
             ItemStack item = items[i];
+            if (Bukkit.getPluginManager().isPluginEnabled("StorageBox") && StorageBoxUtil.tryAddItemToStorageBox(inventory, item)) {
+                continue;
+            }
 
             while (true) {
                 int firstPartial = firstPartial(inventory, item);
