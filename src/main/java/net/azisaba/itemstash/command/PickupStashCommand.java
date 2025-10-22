@@ -1,6 +1,5 @@
 package net.azisaba.itemstash.command;
 
-import net.azisaba.itemstash.ItemStash;
 import net.azisaba.itemstash.ItemStashPlugin;
 import net.azisaba.itemstash.gui.PickupStashScreen;
 import net.azisaba.itemstash.sql.DBConnector;
@@ -11,15 +10,20 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabExecutor;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.scheduler.BukkitRunnable;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.sql.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class PickupStashCommand implements TabExecutor {
     public /* internal */ static final Set<UUID> PROCESSING = Collections.synchronizedSet(new HashSet<>());
     private final ItemStashPlugin plugin;
+    private static final int MAX_LOOPS = 20;
 
     public PickupStashCommand(@NotNull ItemStashPlugin plugin) {
         this.plugin = plugin;
@@ -38,32 +42,60 @@ public class PickupStashCommand implements TabExecutor {
                 return true;
             }
             PROCESSING.add(player.getUniqueId());
-            Bukkit.getScheduler().runTaskAsynchronously((ItemStashPlugin) ItemStash.getInstance(), () -> {
-                try {
+            AtomicLong totalTime = new AtomicLong(0);
+            new BukkitRunnable() {
+                int loops = 0;
+                @Override
+                public void run() {
+                    long start = System.currentTimeMillis();
                     try {
-                        if (DBConnector.isOperationInProgress(player.getUniqueId())) {
-                            player.sendMessage(ChatColor.RED + "前回の処理が継続中です。しばらくしてからお試しください。(Server)");
-                            return;
+                        if (loops == 0) {
+                            if (DBConnector.isOperationInProgress(player.getUniqueId())) {
+                                player.sendMessage(ChatColor.RED + "前回の処理が継続中です。しばらくしてからお試しください。(Server)");
+                                finishProcessing();
+                                return;
+                            }
+                            player.sendMessage(ChatColor.GRAY + "処理中です...");
+                            DBConnector.setOperationInProgress(player.getUniqueId(), true);
                         }
-                        player.sendMessage(ChatColor.GRAY + "処理中です...");
-                        DBConnector.setOperationInProgress(player.getUniqueId(), true);
-                        long start = System.currentTimeMillis();
-                        plugin.dumpStash(player).thenAccept(result -> {
-                            long total = System.currentTimeMillis() - start;
+                        plugin.dumpStash(player).thenAcceptAsync(result -> {
+                            totalTime.addAndGet(System.currentTimeMillis() - start);
+                            loops++;
+
                             if (result) {
-                                player.sendMessage(ChatColor.GREEN + "アイテムをすべて受け取りました。" + ChatColor.DARK_GRAY + " [" + total + "ms]");
+                                int remaining = plugin.getStashItemCount(player.getUniqueId());
+                                if (remaining > 0 && loops < MAX_LOOPS) {
+                                    player.sendMessage(ChatColor.GRAY + "追加でアイテムを受け取っています... (" + remaining + "件残り)");
+                                    this.run();
+                                } else {
+                                    if (remaining > 0) {
+                                        player.sendMessage(ChatColor.YELLOW + "一度に受け取れる上限に達しました。インベントリを整理して再度実行してください。");
+                                    }
+                                    player.sendMessage(ChatColor.GREEN + "アイテムをすべて受け取りました。" + ChatColor.DARK_GRAY + " [" + totalTime.get() + "ms, " + loops + "回処理]");
+                                    finishProcessing();
+                                }
                             } else {
-                                player.sendMessage(ChatColor.RED + "一部のアイテムを受け取れませんでした。" + ChatColor.DARK_GRAY + " [" + total + "ms]");
+                                player.sendMessage(ChatColor.RED + "一部のアイテムを受け取れませんでした。" + ChatColor.DARK_GRAY + " [" + totalTime.get() + "ms, " + loops + "回処理]");
+                                finishProcessing();
                             }
                         });
-                    } finally {
-                        PROCESSING.remove(player.getUniqueId());
-                        DBConnector.setOperationInProgress(player.getUniqueId(), false);
+                    } catch (SQLException e) {
+                        player.sendMessage(ChatColor.RED + "データベースエラーが発生しました。");
+                        finishProcessing();
+                        throw new RuntimeException(e);
                     }
-                } catch (SQLException e) {
-                    throw new RuntimeException(e);
                 }
-            });
+
+                private void finishProcessing() {
+                    PROCESSING.remove(player.getUniqueId());
+                    try {
+                        DBConnector.setOperationInProgress(player.getUniqueId(), false);
+                    } catch (SQLException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+
+            }.runTaskAsynchronously(plugin);
             return true;
         }
         UUID targetUUID = player.getUniqueId();
@@ -113,6 +145,9 @@ public class PickupStashCommand implements TabExecutor {
 
     @Override
     public @Nullable List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command, @NotNull String alias, @NotNull String[] args) {
+        if (args.length == 1) {
+            return Stream.of("nogui").filter(s -> s.startsWith(args[0])).collect(Collectors.toList());
+        }
         return Collections.emptyList();
     }
 }

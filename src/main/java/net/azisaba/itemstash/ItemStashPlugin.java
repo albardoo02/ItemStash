@@ -141,34 +141,34 @@ public class ItemStashPlugin extends JavaPlugin implements ItemStash {
     @Override
     public CompletableFuture<Boolean> dumpStash(@NotNull Player player) {
         return CompletableFuture.supplyAsync(() -> {
-            List<ItemStack> items = new ArrayList<>();
-            List<byte[]> byteList = new ArrayList<>();
+            List<StashItem> fetchedItems = new ArrayList<>();
             try (Connection connection = DBConnector.getConnection()) {
                 Statement statement = connection.createStatement();
                 statement.executeUpdate("LOCK TABLES `stashes` WRITE");
                 try {
-                    try (PreparedStatement stmt = connection.prepareStatement("SELECT `item`, `true_amount` FROM `stashes` WHERE `uuid` = ? ORDER BY IF(`expires_at` = -1, 1, 0), `expires_at` LIMIT 20")) {
+                    try (PreparedStatement stmt = connection.prepareStatement("SELECT `item`, `true_amount`, `expires_at` FROM `stashes` WHERE `uuid` = ? ORDER BY IF(`expires_at` = -1, 1, 0), `expires_at` LIMIT 100")) {
                         stmt.setString(1, player.getUniqueId().toString());
                         try (ResultSet rs = stmt.executeQuery()) {
                             while (rs.next()) {
                                 int trueAmount = rs.getInt("true_amount");
+                                long expiresAt = rs.getLong("expires_at"); // 元の有効期限
                                 Blob blob = rs.getBlob("item");
                                 byte[] bytes = blob.getBytes(1, (int) blob.length());
                                 ItemStack item = ItemStack.deserializeBytes(bytes);
                                 if (trueAmount > 0) {
                                     item.setAmount(trueAmount);
                                 }
-                                items.add(item);
-                                byteList.add(bytes);
+                                fetchedItems.add(new StashItem(item, bytes, expiresAt));
                             }
                         }
                     }
                     try (PreparedStatement stmt = connection.prepareStatement("DELETE FROM `stashes` WHERE `uuid` = ? AND `item` = ? ORDER BY IF(`expires_at` = -1, 1, 0), `expires_at` LIMIT 1")) {
-                        for (byte[] bytes : byteList) {
+                        for (StashItem si : fetchedItems) {
                             stmt.setString(1, player.getUniqueId().toString());
-                            stmt.setBlob(2, new MariaDbBlob(bytes));
-                            stmt.executeUpdate();
+                            stmt.setBlob(2, new MariaDbBlob(si.bytes));
+                            stmt.addBatch();
                         }
+                        stmt.executeBatch();
                     }
                 } finally {
                     statement.executeUpdate("UNLOCK TABLES");
@@ -176,19 +176,66 @@ public class ItemStashPlugin extends JavaPlugin implements ItemStash {
             } catch (SQLException e) {
                 throw new RuntimeException(e);
             }
-            return items;
-        }, async).thenApplyAsync(items -> {
-            if (items.isEmpty()) {
-                return Collections.<ItemStack>emptyList();
+            return fetchedItems;
+        }, async).thenApplyAsync(fetchedItems -> {
+            if (fetchedItems.isEmpty()) {
+                return new AbstractMap.SimpleEntry<Collection<ItemStack>, Map<ItemStack, Long>>(Collections.emptyList(), Collections.emptyMap());
             }
-            getLogger().info("Attempting to give " + items.size() + " item stacks to " + player.getName() + " (" + player.getUniqueId() + "):");
-            ItemUtil.log(getLogger(), items);
-            return ItemUtil.addItem(player.getInventory(), items.toArray(new ItemStack[0])).values();
-        }, sync).thenApplyAsync(notFit -> {
+
+            List<ItemStack> itemsToAdd = new ArrayList<>();
+            Map<ItemStack, Long> expiryMap = new HashMap<>();
+            for (StashItem si : fetchedItems) {
+                itemsToAdd.add(si.item);
+                expiryMap.put(si.item, si.expiresAt);
+            }
+
+            getLogger().info("Attempting to give " + itemsToAdd.size() + " item stacks to " + player.getName() + " (" + player.getUniqueId() + "):");
+            ItemUtil.log(getLogger(), itemsToAdd);
+
+            Collection<ItemStack> notFit = ItemUtil.addItem(player.getInventory(), itemsToAdd.toArray(new ItemStack[0])).values();
+            return new AbstractMap.SimpleEntry<>(notFit, expiryMap);
+        }, sync).thenApplyAsync(result -> {
+            Collection<ItemStack> notFit = result.getKey();
+            Map<ItemStack, Long> expiryMap = result.getValue();
+
+            if (notFit.isEmpty()) {
+                return true;
+            }
+
             getLogger().info("Re-adding " + notFit.size() + " item stacks to " + player.getName() + " (" + player.getUniqueId() + ")'s stash:");
             ItemUtil.log(getLogger(), notFit);
-            notFit.forEach((itemStack) -> addItemToStash(player.getUniqueId(), itemStack));
+            try {
+                DBConnector.runPrepareStatement("INSERT INTO `stashes` (`uuid`, `item`, `expires_at`, `true_amount`) VALUES (?, ?, ?, ?)", statement -> {
+                    for (ItemStack itemStack : notFit) {
+                        long expiresAt = expiryMap.getOrDefault(itemStack, -1L);
+
+                        statement.setString(1, player.getUniqueId().toString());
+                        int amount = itemStack.getAmount();
+                        itemStack.setAmount(Math.min(64, itemStack.getAmount()));
+                        statement.setBlob(2, new MariaDbBlob(itemStack.serializeAsBytes()));
+                        itemStack.setAmount(amount);
+                        statement.setLong(3, expiresAt);
+                        statement.setInt(4, amount);
+                        statement.addBatch();
+                    }
+                    statement.executeBatch();
+                });
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
             return notFit.isEmpty();
         }, async);
+    }
+
+    private static class StashItem {
+        final ItemStack item;
+        final byte[] bytes;
+        final long expiresAt;
+
+        StashItem(ItemStack item, byte[] bytes, long expiresAt) {
+            this.item = item;
+            this.bytes = bytes;
+            this.expiresAt = expiresAt;
+        }
     }
 }
