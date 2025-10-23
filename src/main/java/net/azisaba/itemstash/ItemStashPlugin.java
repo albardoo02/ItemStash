@@ -143,15 +143,14 @@ public class ItemStashPlugin extends JavaPlugin implements ItemStash {
         return CompletableFuture.supplyAsync(() -> {
             List<StashItem> fetchedItems = new ArrayList<>();
             try (Connection connection = DBConnector.getConnection()) {
-                Statement statement = connection.createStatement();
-                statement.executeUpdate("LOCK TABLES `stashes` WRITE");
+                connection.setAutoCommit(false);
                 try {
-                    try (PreparedStatement stmt = connection.prepareStatement("SELECT `item`, `true_amount`, `expires_at` FROM `stashes` WHERE `uuid` = ? ORDER BY IF(`expires_at` = -1, 1, 0), `expires_at` LIMIT 100")) {
+                    try (PreparedStatement stmt = connection.prepareStatement("SELECT `item`, `true_amount`, `expires_at` FROM `stashes` WHERE `uuid` = ? ORDER BY IF(`expires_at` = -1, 1, 0), `expires_at` LIMIT 100 FOR UPDATE")) {
                         stmt.setString(1, player.getUniqueId().toString());
                         try (ResultSet rs = stmt.executeQuery()) {
                             while (rs.next()) {
                                 int trueAmount = rs.getInt("true_amount");
-                                long expiresAt = rs.getLong("expires_at"); // 元の有効期限
+                                long expiresAt = rs.getLong("expires_at");
                                 Blob blob = rs.getBlob("item");
                                 byte[] bytes = blob.getBytes(1, (int) blob.length());
                                 ItemStack item = ItemStack.deserializeBytes(bytes);
@@ -162,6 +161,10 @@ public class ItemStashPlugin extends JavaPlugin implements ItemStash {
                             }
                         }
                     }
+                    if (fetchedItems.isEmpty()) {
+                        connection.commit();
+                        return fetchedItems;
+                    }
                     try (PreparedStatement stmt = connection.prepareStatement("DELETE FROM `stashes` WHERE `uuid` = ? AND `item` = ? ORDER BY IF(`expires_at` = -1, 1, 0), `expires_at` LIMIT 1")) {
                         for (StashItem si : fetchedItems) {
                             stmt.setString(1, player.getUniqueId().toString());
@@ -170,8 +173,12 @@ public class ItemStashPlugin extends JavaPlugin implements ItemStash {
                         }
                         stmt.executeBatch();
                     }
+                    connection.commit();
+                } catch (SQLException e) {
+                    connection.rollback();
+                    throw new RuntimeException(e);
                 } finally {
-                    statement.executeUpdate("UNLOCK TABLES");
+                    connection.setAutoCommit(true);
                 }
             } catch (SQLException e) {
                 throw new RuntimeException(e);
