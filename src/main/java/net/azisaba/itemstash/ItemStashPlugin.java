@@ -21,13 +21,13 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
 public class ItemStashPlugin extends JavaPlugin implements ItemStash {
+    private static final int DUMP_BATCH_SIZE = 20;
     private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
     private final Executor sync = r -> Bukkit.getScheduler().runTask(this, r);
     private final Executor async = r -> Bukkit.getScheduler().runTaskAsynchronously(this, r);
@@ -141,54 +141,85 @@ public class ItemStashPlugin extends JavaPlugin implements ItemStash {
     @Override
     public CompletableFuture<Boolean> dumpStash(@NotNull Player player) {
         return CompletableFuture.supplyAsync(() -> {
-            List<ItemStack> items = new ArrayList<>();
-            List<byte[]> byteList = new ArrayList<>();
-            try (Connection connection = DBConnector.getConnection()) {
-                Statement statement = connection.createStatement();
-                statement.executeUpdate("LOCK TABLES `stashes` WRITE");
-                try {
-                    try (PreparedStatement stmt = connection.prepareStatement("SELECT `item`, `true_amount` FROM `stashes` WHERE `uuid` = ? ORDER BY IF(`expires_at` = -1, 1, 0), `expires_at` LIMIT 20")) {
-                        stmt.setString(1, player.getUniqueId().toString());
-                        try (ResultSet rs = stmt.executeQuery()) {
-                            while (rs.next()) {
-                                int trueAmount = rs.getInt("true_amount");
-                                Blob blob = rs.getBlob("item");
-                                byte[] bytes = blob.getBytes(1, (int) blob.length());
-                                ItemStack item = ItemStack.deserializeBytes(bytes);
-                                if (trueAmount > 0) {
-                                    item.setAmount(trueAmount);
-                                }
-                                items.add(item);
-                                byteList.add(bytes);
-                            }
-                        }
-                    }
-                    try (PreparedStatement stmt = connection.prepareStatement("DELETE FROM `stashes` WHERE `uuid` = ? AND `item` = ? ORDER BY IF(`expires_at` = -1, 1, 0), `expires_at` LIMIT 1")) {
-                        for (byte[] bytes : byteList) {
-                            stmt.setString(1, player.getUniqueId().toString());
-                            stmt.setBlob(2, new MariaDbBlob(bytes));
-                            stmt.executeUpdate();
-                        }
-                    }
-                } finally {
-                    statement.executeUpdate("UNLOCK TABLES");
+            while (true) {
+                List<ItemStack> items = fetchNextStashBatch(player.getUniqueId());
+                if (items.isEmpty()) {
+                    return true;
                 }
-            } catch (SQLException e) {
-                throw new RuntimeException(e);
+                getLogger().info("Attempting to give " + items.size() + " item stacks to " + player.getName() + " (" + player.getUniqueId() + "):");
+                ItemUtil.log(getLogger(), items);
+                Collection<ItemStack> notFit = CompletableFuture
+                        .supplyAsync(() -> ItemUtil.addItem(player.getInventory(), items.toArray(new ItemStack[0])).values(), sync)
+                        .join();
+                if (!notFit.isEmpty()) {
+                    getLogger().info("Re-adding " + notFit.size() + " item stacks to " + player.getName() + " (" + player.getUniqueId() + ")'s stash:");
+                    ItemUtil.log(getLogger(), notFit);
+                    notFit.forEach((itemStack) -> addItemToStash(player.getUniqueId(), itemStack));
+                    return false;
+                }
+                if (items.size() < DUMP_BATCH_SIZE) {
+                    return true;
+                }
             }
-            return items;
-        }, async).thenApplyAsync(items -> {
-            if (items.isEmpty()) {
-                return Collections.<ItemStack>emptyList();
-            }
-            getLogger().info("Attempting to give " + items.size() + " item stacks to " + player.getName() + " (" + player.getUniqueId() + "):");
-            ItemUtil.log(getLogger(), items);
-            return ItemUtil.addItem(player.getInventory(), items.toArray(new ItemStack[0])).values();
-        }, sync).thenApplyAsync(notFit -> {
-            getLogger().info("Re-adding " + notFit.size() + " item stacks to " + player.getName() + " (" + player.getUniqueId() + ")'s stash:");
-            ItemUtil.log(getLogger(), notFit);
-            notFit.forEach((itemStack) -> addItemToStash(player.getUniqueId(), itemStack));
-            return notFit.isEmpty();
         }, async);
+    }
+
+    private @NotNull List<ItemStack> fetchNextStashBatch(@NotNull UUID playerUuid) {
+        List<ItemStack> items = new ArrayList<>();
+        List<Long> stashIds = new ArrayList<>();
+        try (Connection connection = DBConnector.getConnection()) {
+            try {
+                connection.setAutoCommit(false);
+                String uuid = playerUuid.toString();
+                collectStashRows(connection, uuid, "SELECT `id`, `item`, `true_amount` FROM `stashes` WHERE `uuid` = ? AND `expires_at` <> -1 ORDER BY `expires_at`, `id` LIMIT ?", DUMP_BATCH_SIZE, items, stashIds);
+                if (items.size() < DUMP_BATCH_SIZE) {
+                    collectStashRows(connection, uuid, "SELECT `id`, `item`, `true_amount` FROM `stashes` WHERE `uuid` = ? AND `expires_at` = -1 ORDER BY `id` LIMIT ?", DUMP_BATCH_SIZE - items.size(), items, stashIds);
+                }
+                try (PreparedStatement stmt = connection.prepareStatement("DELETE FROM `stashes` WHERE `id` = ?")) {
+                    for (Long stashId : stashIds) {
+                        stmt.setLong(1, stashId);
+                        stmt.addBatch();
+                    }
+                    stmt.executeBatch();
+                }
+                connection.commit();
+                return items;
+            } catch (SQLException e) {
+                connection.rollback();
+                throw e;
+            } finally {
+                connection.setAutoCommit(true);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void collectStashRows(@NotNull Connection connection,
+                                  @NotNull String uuid,
+                                  @NotNull String sql,
+                                  int limit,
+                                  @NotNull List<ItemStack> items,
+                                  @NotNull List<Long> stashIds) throws SQLException {
+        if (limit <= 0) {
+            return;
+        }
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setString(1, uuid);
+            stmt.setInt(2, limit);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    int trueAmount = rs.getInt("true_amount");
+                    Blob blob = rs.getBlob("item");
+                    byte[] bytes = blob.getBytes(1, (int) blob.length());
+                    ItemStack item = ItemStack.deserializeBytes(bytes);
+                    if (trueAmount > 0) {
+                        item.setAmount(trueAmount);
+                    }
+                    items.add(item);
+                    stashIds.add(rs.getLong("id"));
+                }
+            }
+        }
     }
 }

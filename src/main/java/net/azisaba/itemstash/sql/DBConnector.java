@@ -84,16 +84,73 @@ public class DBConnector {
 
     public static void createTables() throws SQLException {
         runPrepareStatement("CREATE TABLE IF NOT EXISTS `stashes` (\n" +
+                "  `id` BIGINT NOT NULL AUTO_INCREMENT,\n" +
                 "  `uuid` VARCHAR(36) NOT NULL,\n" +
                 "  `item` MEDIUMBLOB NOT NULL,\n" +
                 "  `expires_at` BIGINT NOT NULL DEFAULT -1,\n" +
-                "  `true_amount` INT NOT NULL DEFAULT -1\n" +
+                "  `true_amount` INT NOT NULL DEFAULT -1,\n" +
+                "  PRIMARY KEY (`id`)\n" +
                 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;", PreparedStatement::execute);
         runPrepareStatement("CREATE TABLE IF NOT EXISTS `stashes_players` (\n" +
                 "  `uuid` VARCHAR(36) NOT NULL PRIMARY KEY,\n" +
                 "  `operation_in_progress` BIGINT NOT NULL DEFAULT 0,\n" +
                 "  `suppress_notification` TINYINT(1) NOT NULL DEFAULT 0" +
                 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;", PreparedStatement::execute);
+        ensureStashesSchema();
+    }
+
+    private static void ensureStashesSchema() throws SQLException {
+        use(connection -> {
+            if (!hasColumn(connection, "stashes", "id")) {
+                try (Statement statement = connection.createStatement()) {
+                    statement.executeUpdate("ALTER TABLE `stashes` ADD COLUMN `id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST");
+                }
+            }
+            if (!hasPrimaryKey(connection, "stashes")) {
+                try (Statement statement = connection.createStatement()) {
+                    statement.executeUpdate("ALTER TABLE `stashes` ADD PRIMARY KEY (`id`)");
+                }
+            }
+            ensureIndex(connection, "stashes", "idx_stashes_uuid_expires_id",
+                    "CREATE INDEX `idx_stashes_uuid_expires_id` ON `stashes` (`uuid`, `expires_at`, `id`)");
+            ensureIndex(connection, "stashes", "idx_stashes_uuid_id",
+                    "CREATE INDEX `idx_stashes_uuid_id` ON `stashes` (`uuid`, `id`)");
+        });
+    }
+
+    private static boolean hasColumn(@NotNull Connection connection, @NotNull String tableName, @NotNull String columnName) throws SQLException {
+        DatabaseMetaData metaData = connection.getMetaData();
+        try (ResultSet rs = metaData.getColumns(connection.getCatalog(), null, tableName, columnName)) {
+            return rs.next();
+        }
+    }
+
+    private static boolean hasPrimaryKey(@NotNull Connection connection, @NotNull String tableName) throws SQLException {
+        DatabaseMetaData metaData = connection.getMetaData();
+        try (ResultSet rs = metaData.getPrimaryKeys(connection.getCatalog(), null, tableName)) {
+            return rs.next();
+        }
+    }
+
+    private static void ensureIndex(@NotNull Connection connection, @NotNull String tableName, @NotNull String indexName, @Language("SQL") @NotNull String createIndexSql) throws SQLException {
+        if (hasIndex(connection, tableName, indexName)) {
+            return;
+        }
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate(createIndexSql);
+        }
+    }
+
+    private static boolean hasIndex(@NotNull Connection connection, @NotNull String tableName, @NotNull String indexName) throws SQLException {
+        DatabaseMetaData metaData = connection.getMetaData();
+        try (ResultSet rs = metaData.getIndexInfo(connection.getCatalog(), null, tableName, false, false)) {
+            while (rs.next()) {
+                if (indexName.equalsIgnoreCase(rs.getString("INDEX_NAME"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

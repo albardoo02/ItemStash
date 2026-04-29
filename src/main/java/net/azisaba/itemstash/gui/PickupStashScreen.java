@@ -18,35 +18,45 @@ import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.jetbrains.annotations.NotNull;
-import org.mariadb.jdbc.MariaDbBlob;
 
-import java.sql.*;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.text.SimpleDateFormat;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 
 public class PickupStashScreen implements InventoryHolder {
     private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
     private final Inventory inventory = Bukkit.createInventory(this, 54, "Stash回収");
-    private final List<Map.Entry<ItemStack, Long>> items;
+    private final UUID stashOwner;
+    private final List<DisplayEntry> items;
     private int page = 0;
     private boolean acceptingClick = true;
 
-    public PickupStashScreen(@NotNull List<Map.Entry<@NotNull ItemStack, @NotNull Long>> items) {
-        this.items = new ArrayList<>(flatten(items).entrySet());
+    public PickupStashScreen(@NotNull UUID stashOwner, @NotNull List<StashEntry> items) {
+        this.stashOwner = stashOwner;
+        this.items = flatten(items);
         initInventory();
     }
 
-    private static @NotNull Map<@NotNull ItemStack, @NotNull Long> flatten(@NotNull List<Map.Entry<@NotNull ItemStack, @NotNull Long>> items) {
-        Map<ItemStack, Long> flattened = new HashMap<>();
-        for (Map.Entry<ItemStack, Long> item : items) {
-            Optional<Map.Entry<ItemStack, Long>> opt = flattened.entrySet().stream().filter(is -> is.getKey().isSimilar(item.getKey())).findAny();
+    private static @NotNull List<DisplayEntry> flatten(@NotNull List<StashEntry> items) {
+        List<DisplayEntry> flattened = new ArrayList<>();
+        for (StashEntry item : items) {
+            Optional<DisplayEntry> opt = flattened.stream().filter(is -> is.item.isSimilar(item.item)).findAny();
             if (opt.isPresent()) {
-                opt.get().getKey().setAmount(opt.get().getKey().getAmount() + item.getKey().getAmount());
-                if (opt.get().getValue() > item.getValue()) {
-                    opt.get().setValue(item.getValue());
+                DisplayEntry entry = opt.get();
+                entry.item.setAmount(entry.item.getAmount() + item.item.getAmount());
+                if (entry.expiresAt == -1 || (item.expiresAt != -1 && entry.expiresAt > item.expiresAt)) {
+                    entry.expiresAt = item.expiresAt;
                 }
+                entry.stashIds.add(item.id);
             } else {
-                flattened.put(item.getKey(), item.getValue());
+                flattened.add(new DisplayEntry(item));
             }
         }
         return flattened;
@@ -55,12 +65,13 @@ public class PickupStashScreen implements InventoryHolder {
     public void initInventory() {
         inventory.clear();
         for (int i = 0; i < items.subList(page * 45, Math.min((page + 1) * 45, items.size())).size(); i++) {
-            ItemStack screenItem = items.get(page * 45 + i).getKey().clone();
+            DisplayEntry entry = items.get(page * 45 + i);
+            ItemStack screenItem = entry.item.clone();
             if (screenItem.getItemMeta() == null) {
                 ((ItemStashPlugin) ItemStash.getInstance()).getSLF4JLogger().info("{} (#{}) does not have item meta", screenItem, i);
                 continue;
             }
-            long expiresAt = items.get(page * 45 + i).getValue();
+            long expiresAt = entry.expiresAt;
             List<String> lore = screenItem.getLore();
             if (lore == null) {
                 lore = new ArrayList<>();
@@ -91,6 +102,30 @@ public class PickupStashScreen implements InventoryHolder {
         return inventory;
     }
 
+    public static class StashEntry {
+        private final long id;
+        private final ItemStack item;
+        private final long expiresAt;
+
+        public StashEntry(long id, @NotNull ItemStack item, long expiresAt) {
+            this.id = id;
+            this.item = item;
+            this.expiresAt = expiresAt;
+        }
+    }
+
+    private static class DisplayEntry {
+        private final ItemStack item;
+        private long expiresAt;
+        private final List<Long> stashIds = new ArrayList<Long>();
+
+        private DisplayEntry(@NotNull StashEntry entry) {
+            this.item = entry.item.clone();
+            this.expiresAt = entry.expiresAt;
+            this.stashIds.add(entry.id);
+        }
+    }
+
     public static class EventListener implements Listener {
         private final ItemStashPlugin plugin;
 
@@ -115,7 +150,9 @@ public class PickupStashScreen implements InventoryHolder {
                 return;
             }
             PickupStashScreen screen = (PickupStashScreen) e.getInventory().getHolder();
-            if (!screen.acceptingClick) return;
+            if (!screen.acceptingClick) {
+                return;
+            }
             if (e.getSlot() == 45) {
                 if (screen.page > 0) {
                     screen.page--;
@@ -134,7 +171,8 @@ public class PickupStashScreen implements InventoryHolder {
                 return;
             }
             PickupStashCommand.PROCESSING.add(e.getWhoClicked().getUniqueId());
-            ItemStack stack = screen.items.get(screen.page * 45 + e.getSlot()).getKey();
+            DisplayEntry displayEntry = screen.items.get(screen.page * 45 + e.getSlot());
+            ItemStack stack = displayEntry.item.clone();
             int originalAmount = stack.getAmount();
             screen.acceptingClick = false;
             Bukkit.getScheduler().runTask(plugin, () -> {
@@ -144,32 +182,18 @@ public class PickupStashScreen implements InventoryHolder {
                 long start = System.currentTimeMillis();
                 Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
                     try (Connection connection = DBConnector.getConnection()) {
-                        DBConnector.setOperationInProgress(e.getWhoClicked().getUniqueId(), true);
-                        List<byte[]> toRemove = new ArrayList<>();
-                        try (PreparedStatement stmt = connection.prepareStatement("SELECT `item` FROM `stashes` WHERE `uuid` = ?")) {
-                            stmt.setString(1, e.getWhoClicked().getUniqueId().toString());
-                            try (ResultSet rs = stmt.executeQuery()) {
-                                while (rs.next()) {
-                                    Blob blob = rs.getBlob("item");
-                                    byte[] bytes = blob.getBytes(1, (int) blob.length());
-                                    if (ItemStack.deserializeBytes(bytes).isSimilar(stack) && toRemove.stream().noneMatch(arr -> Arrays.equals(arr, bytes))) {
-                                        toRemove.add(bytes);
-                                    }
-                                }
+                        DBConnector.setOperationInProgress(screen.stashOwner, true);
+                        try (PreparedStatement stmt = connection.prepareStatement("DELETE FROM `stashes` WHERE `id` = ?")) {
+                            for (Long stashId : displayEntry.stashIds) {
+                                stmt.setLong(1, stashId);
+                                stmt.addBatch();
                             }
-                        }
-                        plugin.getLogger().info("Collected " + toRemove.size() + " items to remove");
-                        try (PreparedStatement stmt = connection.prepareStatement("DELETE FROM `stashes` WHERE `uuid` = ? AND `item` = ?")) {
-                            for (byte[] bytes : toRemove) {
-                                stmt.setString(1, e.getWhoClicked().getUniqueId().toString());
-                                stmt.setBlob(2, new MariaDbBlob(bytes));
-                                stmt.executeUpdate();
-                            }
+                            stmt.executeBatch();
                         }
                     } catch (SQLException ex) {
                         PickupStashCommand.PROCESSING.remove(e.getWhoClicked().getUniqueId());
                         try {
-                            DBConnector.setOperationInProgress(e.getWhoClicked().getUniqueId(), false);
+                            DBConnector.setOperationInProgress(screen.stashOwner, false);
                         } catch (SQLException exc) {
                             exc.addSuppressed(ex);
                             throw new RuntimeException(exc);
@@ -183,7 +207,7 @@ public class PickupStashScreen implements InventoryHolder {
                             Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
                                 PickupStashCommand.PROCESSING.remove(e.getWhoClicked().getUniqueId());
                                 try {
-                                    DBConnector.setOperationInProgress(e.getWhoClicked().getUniqueId(), false);
+                                    DBConnector.setOperationInProgress(screen.stashOwner, false);
                                 } catch (SQLException ex) {
                                     plugin.getSLF4JLogger().error("Failed to set operation_in_progress state", ex);
                                 }
@@ -195,7 +219,7 @@ public class PickupStashScreen implements InventoryHolder {
                                 try {
                                     int amount = 0;
                                     for (ItemStack item : items) {
-                                        plugin.addItemToStash(e.getWhoClicked().getUniqueId(), item);
+                                        plugin.addItemToStash(screen.stashOwner, item);
                                         amount += item.getAmount();
                                     }
                                     long elapsed = System.currentTimeMillis() - start;
@@ -203,7 +227,7 @@ public class PickupStashScreen implements InventoryHolder {
                                 } finally {
                                     PickupStashCommand.PROCESSING.remove(e.getWhoClicked().getUniqueId());
                                     try {
-                                        DBConnector.setOperationInProgress(e.getWhoClicked().getUniqueId(), false);
+                                        DBConnector.setOperationInProgress(screen.stashOwner, false);
                                     } catch (SQLException ex) {
                                         plugin.getSLF4JLogger().error("Failed to set operation_in_progress state", ex);
                                     }

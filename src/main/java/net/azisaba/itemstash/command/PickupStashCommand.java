@@ -83,25 +83,10 @@ public class PickupStashCommand implements TabExecutor {
                     return;
                 }
                 player.sendMessage(ChatColor.GRAY + "処理中です...");
-                List<Map.Entry<ItemStack, Long>> items = new ArrayList<>();
-                try (PreparedStatement stmt = connection.prepareStatement("SELECT `item`, `expires_at`, `true_amount` FROM `stashes` WHERE `uuid` = ?")) {
-                    stmt.setString(1, finalTargetUUID.toString());
-                    try (ResultSet rs = stmt.executeQuery()) {
-                        while (rs.next()) {
-                            Blob blob = rs.getBlob("item");
-                            byte[] bytes = blob.getBytes(1, (int) blob.length());
-                            long expiresAt = rs.getLong("expires_at");
-                            int trueAmount = rs.getInt("true_amount");
-                            ItemStack item = ItemStack.deserializeBytes(bytes);
-                            if (trueAmount > 0) {
-                                item.setAmount(trueAmount);
-                            }
-                            //plugin.getLogger().info("Item: " + item);
-                            items.add(new AbstractMap.SimpleImmutableEntry<>(item, expiresAt));
-                        }
-                    }
-                }
-                Bukkit.getScheduler().runTask(plugin, () -> player.openInventory(new PickupStashScreen(items).getInventory()));
+                List<PickupStashScreen.StashEntry> items = new ArrayList<>();
+                loadEntries(connection, finalTargetUUID, "SELECT `id`, `item`, `expires_at`, `true_amount` FROM `stashes` WHERE `uuid` = ? AND `expires_at` <> -1 ORDER BY `expires_at`, `id`", items);
+                loadEntries(connection, finalTargetUUID, "SELECT `id`, `item`, `expires_at`, `true_amount` FROM `stashes` WHERE `uuid` = ? AND `expires_at` = -1 ORDER BY `id`", items);
+                Bukkit.getScheduler().runTask(plugin, () -> player.openInventory(new PickupStashScreen(finalTargetUUID, items).getInventory()));
             } catch (SQLException e) {
                 throw new RuntimeException(e);
             } finally {
@@ -109,6 +94,28 @@ public class PickupStashCommand implements TabExecutor {
             }
         });
         return true;
+    }
+
+    private void loadEntries(@NotNull Connection connection,
+                             @NotNull UUID targetUUID,
+                             @NotNull String sql,
+                             @NotNull List<PickupStashScreen.StashEntry> items) throws SQLException {
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setString(1, targetUUID.toString());
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    Blob blob = rs.getBlob("item");
+                    byte[] bytes = blob.getBytes(1, (int) blob.length());
+                    long expiresAt = rs.getLong("expires_at");
+                    int trueAmount = rs.getInt("true_amount");
+                    ItemStack item = ItemStack.deserializeBytes(bytes);
+                    if (trueAmount > 0) {
+                        item.setAmount(trueAmount);
+                    }
+                    items.add(new PickupStashScreen.StashEntry(rs.getLong("id"), item, expiresAt));
+                }
+            }
+        }
     }
 
     @Override
